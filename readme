@@ -1,1 +1,108 @@
+超市进销存系统设计方案
+文档状态： 需求评审稿
 
+版本： 1.0
+
+目标技术栈： Django REST Framework、Vue 3、MySQL
+
+1. 建设目标与范围
+系统用于单家超市的日常商品、会员、采购、收货、销售和库存管理。前后端分离：Django 提供 JSON API，Vue 3 提供管理后台；MySQL 保存业务数据。
+
+本方案先按一个门店、一个默认仓库、员工使用后台、会员作为顾客档案设计。首期包含基础收银销售记录，不包含在线商城、线上支付、多门店调拨、复杂促销、供应商结算和完整财务核算。易耗品或生鲜的批次、效期追踪作为后续扩展项，是否纳入首期需评审确认。
+
+员工账号与会员档案分离：员工使用 Django 认证登录管理后台；会员是消费业务资料，不默认拥有后台账号。若将来要开放会员端，再单独设计会员认证流程。
+
+2. 核心设计约定
+主键统一使用 BIGINT；数量使用 DECIMAL(14,3)，金额使用 DECIMAL(12,2)，避免浮点数误差。商品可配置数量精度，例如件数为 0 位、称重商品为 3 位。
+所有业务表使用 created_at、updated_at；业务单据另存单据日期、操作人和状态。订单、流水不物理删除，通过作废、退款等状态保留审计记录。
+库存数量只能由收货、销售、退货、盘点或库存调整业务更新，不允许直接编辑库存余额。
+Django 使用自定义员工用户模型并复用 Django 的组和权限机制。应在首次数据库迁移前确定自定义用户模型，避免后续迁移困难。
+重要编号、SKU、会员号、条码和单据号建立唯一索引；外键按业务采用限制删除，历史商品和会员通过停用保留。
+3. 数据表设计
+以下字段为首期建议字段，id 为主键；外键和唯一约束在字段说明中标出。字段类型可按 Django BigAutoField、CharField、DecimalField、DateTimeField 等实现。
+
+3.1 员工、会员与地址
+表名	用途与核心字段
+accounts_user	Django 自定义员工账号：username（唯一）、password（Django 哈希）、display_name、phone、email、is_active、is_staff、receive_stock_alert。员工角色使用 Django Group/Permission，不重复建一套权限表。
+crm_member_level	会员等级（可选）：code（唯一）、name、growth_threshold、points_rate、is_active。首期不做等级权益时可暂缓。
+crm_member	会员主档：member_no（唯一）、name、phone（可空，非空时唯一）、email、gender、birthday、level_id（可空外键）、points_balance、status、joined_at。
+crm_member_address	会员地址：member_id 外键、receiver_name、receiver_phone、province、city、district、address_line、postal_code、is_default、is_active。索引 member_id；设置默认地址时在事务中先清除该会员其他默认地址。
+crm_member_points_log	积分流水（启用积分时）：member_id、change_type、points_delta、balance_after、source_type、source_id、operator_id、created_at。积分余额由流水计算并维护，禁止无记录地修改。
+3.2 商品、分类、供应商与仓库
+表名	用途与核心字段
+catalog_category	商品分类：parent_id（自关联，可空）、code（唯一）、name、sort_order、is_active。分类采用树形结构，存在商品时不允许硬删除。
+catalog_product	商品/SKU：sku_code（唯一）、barcode（可空且唯一）、name、category_id 外键、brand、specification、unit、quantity_scale、sale_price、reference_cost、shelf_life_days（可空）、status。每个可独立销售的规格建一条 SKU。
+purchase_supplier	供应商：supplier_code（唯一）、name、contact_name、phone、email、address、status、remark。
+purchase_product_supplier	商品供应关系：product_id、supplier_id、supplier_sku、purchase_price、min_order_qty、order_multiple、is_preferred。对 (product_id, supplier_id) 建唯一约束，支持一个商品多个供应商。
+inventory_warehouse	仓库/库存地点：code（唯一）、name、is_default、is_active。首期只创建一个默认仓库，保留扩展多仓能力。
+3.3 库存、沽清、盘点与流水
+表名	用途与核心字段
+inventory_stock	商品库存余额：warehouse_id、product_id、on_hand_qty、reserved_qty、updated_at。对 (warehouse_id, product_id) 建唯一约束。可售量按 on_hand_qty - reserved_qty 计算，不另存重复字段。
+inventory_policy	库存策略：warehouse_id、product_id、low_stock_threshold、safety_stock、target_stock、alert_enabled。对仓库和商品建唯一约束。
+inventory_sell_control	人工销售控制：warehouse_id、product_id、status（NORMAL、MANUAL_SOLD_OUT、PAUSED）、reason、updated_by、updated_at。对仓库和商品建唯一约束。库存为零导致的自动缺货由库存计算，不伪造库存流水；人工沽清或停售独立记录，补货后仍由员工明确恢复销售。
+inventory_adjustment	盘点/损耗/过期/纠错单：adjustment_no（唯一）、warehouse_id、adjustment_type、status（DRAFT、CONFIRMED、CANCELLED）、reason、created_by、confirmed_by、confirmed_at。
+inventory_adjustment_item	调整明细：adjustment_id、product_id、system_qty、counted_qty（盘点时填写）、qty_delta、remark。确认单据后才生成库存流水。
+inventory_transaction	库存不可变流水：warehouse_id、product_id、transaction_type、qty_delta（入库为正、出库为负）、qty_before、qty_after、unit_cost（可空）、reference_type、reference_id、reference_line_id、operator_id、created_at。对商品、仓库、时间建查询索引；对业务明细来源建立幂等唯一约束，防止重复记账。
+3.4 采购与收货
+表名	用途与核心字段
+purchase_order	采购单：order_no（唯一）、supplier_id、status（DRAFT、APPROVED、PARTIAL、COMPLETED、CANCELLED）、expected_at、total_amount、created_by、approved_by、remark。
+purchase_order_item	采购明细：order_id、product_id、ordered_qty、received_qty、unit_cost、line_amount。允许分批收货；采购单本身不增加库存。
+purchase_receipt	收货单：receipt_no（唯一）、order_id、status、received_by、received_at、remark。
+purchase_receipt_item	实收明细：receipt_id、order_item_id、product_id、received_qty、unit_cost、batch_no（可空）、expiry_date（可空）。确认收货后增加库存并写入流水。若要求按批次扣减和先进先出，需增设库存批次余额表。
+3.5 销售与退货
+表名	用途与核心字段
+sales_order	销售单：order_no（唯一）、member_id（散客可空）、cashier_id、status（PAID、VOID、PARTIALLY_REFUNDED、REFUNDED）、subtotal、discount_amount、payable_amount、paid_amount、payment_method、paid_at。
+sales_order_item	销售明细：order_id、product_id、sku_snapshot、product_name_snapshot、unit_snapshot、qty、unit_price、discount_amount、line_amount、unit_cost_snapshot。保存名称和价格快照，商品资料变更不影响历史小票。
+sales_return	退货单：return_no（唯一）、order_id、status、reason、refund_amount、handled_by、handled_at。
+sales_return_item	退货明细：return_id、order_item_id、return_qty、restock_qty、damaged_qty、refund_amount。只有验收后可重新销售的数量回入库存。
+3.6 低库存预警与邮件记录
+表名	用途与核心字段
+inventory_stock_alert_event	预警状态变化事件：warehouse_id、product_id、event_type（LOW、RECOVERED、REMINDER）、available_qty、threshold_qty、created_at。库存从正常跨到阈值以下时创建 LOW，恢复到阈值以上时创建 RECOVERED。
+notification_delivery_log	邮件投递记录：alert_event_id、recipient_email、subject、status（PENDING、SENT、FAILED）、attempt_count、error_message、sent_at、created_at。收件人取启用且勾选 receive_stock_alert 的员工账号。SMTP 密码放在环境变量或密钥配置中，不存数据库。
+3.7 主要关系
+分类 1:N 商品；会员 1:N 地址和销售单；员工 1:N 操作单据。
+商品与仓库通过库存余额、库存策略和销售控制形成 N:M；供应商与商品通过 purchase_product_supplier 形成 N:M。
+采购单 1:N 采购明细；采购单可有多张收货单，收货单 1:N 实收明细。
+销售单 1:N 销售明细；销售单 1:N 退货单，退货单 1:N 退货明细。
+收货、销售、退货、库存调整等已确认业务单据均产生库存流水。库存余额是快速查询用的当前值，流水是可审计的变动依据。
+4. 关键业务规则
+库存更新
+可售库存定义为：on_hand_qty - reserved_qty。首期无线上订单时 reserved_qty 通常为 0。收货确认、销售支付、退货验收、库存调整必须在同一数据库事务中完成：锁定对应库存行、检查数量、写流水、更新余额和单据状态。出库前检查可售量，拒绝负库存；重复提交同一业务明细不得重复产生流水。
+
+沽清与停售
+人工沽清/停售写入 inventory_sell_control，不通过把库存改成 0 来实现。商品是否可销售由商品状态、人工控制状态和可售库存共同决定。真实库存为 0 时自动判为缺货；补货到库后，自动缺货会消失，但人工停售需员工主动解除。
+
+补货建议
+补货列表根据商品库存策略计算，不把可推导的“建议数量”另存成库存事实。建议量可按以下规则估算：
+
+建议量 = max(0, 目标库存 - 可售库存 - 已审核未收货数量)
+
+再结合首选供应商、最小起订量和订货倍数调整。员工确认建议后生成采购单；未审核的草稿采购单不计入在途数量。
+
+邮件预警
+当可售库存首次降到或低于预警阈值时创建低库存事件并异步发送邮件；同一低库存周期不重复发送。库存恢复后记录恢复事件，之后再次降到阈值以下可发起新一轮预警。可配置提醒冷却时间。发送失败写入投递日志并支持重试。原型阶段可用定时 Django 管理命令；正式运行建议使用后台任务队列，避免邮件发送阻塞收银或库存请求。
+
+5. 系统模块与页面
+Vue 3 管理端建议采用 Vue Router、Pinia 和统一 API 请求层，按权限显示菜单与操作按钮。Django REST Framework 提供鉴权、序列化、业务校验和事务处理。
+
+工作台： 今日销售额、订单数、低库存商品、待收货采购单。
+商品管理： 分类、商品/SKU、条码、售价、单位、启停状态。
+会员管理： 会员档案、等级、积分记录、多个收货地址。
+供应商与采购： 供应商、商品供货关系、采购单、审批、分批收货。
+销售收银： 条码检索、购物明细、会员选择、付款记录、退货处理。
+库存管理： 库存查询、盘点/损耗调整、库存流水、人工沽清/恢复、低库存预警、补货建议。
+系统管理： 员工账号、Django 组权限、邮件接收人和基础参数。
+建议角色为管理员、采购员、收货/库存员、收银员和只读经理。角色仅作为权限组；后端 API 必须进行权限校验，不能只依赖前端隐藏按钮。
+
+6. 首期验收标准
+员工可登录；不同角色只能执行授权的管理、采购、收货、销售和库存操作。
+可创建分类、商品、供应商、会员和会员地址；关键编号及条码不能重复。
+采购单审批后可分批收货；每次确认收货都准确增加库存并留下唯一库存流水。
+销售支付扣减库存；库存不足或并发销售导致不足时拒绝超卖；撤销和退货按规则冲回。
+盘点及损耗调整有操作人、原因和确认状态，确认后才影响库存。
+库存低于阈值时生成事件并发送邮件；邮件失败可查日志，同一低库存周期不会持续重复轰炸收件人。
+补货建议扣除已审核未收货数量，并能由员工转为采购单。
+7. 实施顺序与待确认项
+建议按以下顺序实施：确认本方案范围；先建立员工认证、分类、商品、会员和地址；再完成供应商、采购、收货与库存流水；随后实现收银、退货、盘点和调整；最后实现补货建议、邮件预警、权限细化和端到端验收。
+
+开工前需确认三项业务边界：是否需要首期会员积分/等级；是否需要生鲜批次与保质期预警/先进先出；收银是否仅记录现金、银行卡等线下付款，还是需要对接真实支付渠道。若无额外要求，建议按本文首期范围实施，积分、批次效期和支付对接作为后续迭代。
